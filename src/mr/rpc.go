@@ -14,16 +14,50 @@ import "strconv"
 // and reply for an RPC.
 //
 
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
 
 // Add your RPC definitions here.
 
+type InputFileNameRequest struct{
+	WorkerId int
+}
+
+type InputFileNameReply struct {
+
+	WorkId int
+	FileName []string
+}
+
+
+type PushIntermediateFileRequest struct{
+
+	WorkId int
+	IntermediateFileName []string
+}
+
+type PushIntermediateFileReply struct{
+	WorkerId int
+	Ok bool
+}
+
+type ReduceInputFileNameRequest struct {
+	WorkerId int
+}
+
+type ReduceInputFileNameReply struct{
+
+	WorkerId int
+	FileName []string
+}
+
+
+type MapDone struct {
+	WorkerId int
+}
+
+type MapDoneReply struct {
+	WorkerId int
+	Ok bool
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
