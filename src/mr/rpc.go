@@ -6,57 +6,61 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
 // and reply for an RPC.
 //
 
-
 // Add your RPC definitions here.
 
-type InputFileNameRequest struct{
+type WorkerIdAndReduceNumberRequest struct {
+	WorkerId int
+}
+type WorkerIdAndReduceNumberReply struct {
+	WorkerId     int
+	ReduceNumber int
+}
+
+type GetTaskRequest struct {
 	WorkerId int
 }
 
-type InputFileNameReply struct {
-
-	WorkId int
+type GetTaskReply struct {
+	TaskId   int
 	FileName []string
 }
 
-
-type PushIntermediateFileRequest struct{
-
-	WorkId int
+type ReportCompleteRequest struct {
+	TaskId               int
 	IntermediateFileName []string
 }
 
-type PushIntermediateFileReply struct{
-	WorkerId int
-	Ok bool
+type ReportCompleteReply struct {
+	Done bool
 }
 
-type ReduceInputFileNameRequest struct {
+type GetReduceTaskRequest struct {
 	WorkerId int
 }
 
-type ReduceInputFileNameReply struct{
-
+type GetReduceTaskReply struct {
+	TaskId   int
 	WorkerId int
 	FileName []string
 }
 
-
-type MapDone struct {
+type ReportReduceDoneRequest struct {
+	TaskId   int
 	WorkerId int
 }
 
-type MapDoneReply struct {
-	WorkerId int
-	Ok bool
+type ReportReduceDoneReply struct {
+	CompleteDone bool
 }
 
 // Cook up a unique-ish UNIX-domain socket name
