@@ -27,7 +27,7 @@ func TestInitialElection2A(t *testing.T) {
 	cfg.begin("Test (2A): initial election")
 
 	// is a leader elected?
-	
+
 	cfg.checkOneLeader()
 
 	// sleep a bit to avoid racing with followers learning of the
@@ -489,7 +489,7 @@ func TestRejoin2B(t *testing.T) {
 
 	// old leader connected again
 	cfg.connect(leader1)
-
+	// 重试，直到有一个server认为自己为leader，向其提交command
 	cfg.one(104, 2, true)
 
 	// all together now
@@ -547,7 +547,7 @@ func TestBackup2B(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader2].Start(rand.Int())
 	}
-
+	DPrintf("RaftNode appendEntries start 50")
 	time.Sleep(RaftElectionTimeout / 2)
 
 	// bring original leader back to life,

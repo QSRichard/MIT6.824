@@ -96,7 +96,7 @@ type Raft struct {
 	lastActiveTime time.Time
 	lastBroadcastTime time.Time
 
-	// applyCh chan ApplyMsg // 应用层的提交队列
+	applyCh chan ApplyMsg // 应用层的提交队列
 
 }
 
@@ -244,21 +244,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if len(rf.log) != 0 {
 			lastLogTerm = rf.log[len(rf.log)-1].Term
 		}
-		if args.LastLogTerm < lastLogTerm || args.LastLogIndex < len(rf.log) {
-			return
-		}
-		rf.votedFor = args.CandidateId
-		reply.VoteGranted = true
-		// 重置时间
-		rf.lastActiveTime = time.Now()
 
-				// 这里坑了好久，一定要严格遵守论文的逻辑，另外log长度一样也是可以给对方投票的
+		// log长度一样可以投票
 		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= len(rf.log)) {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
-			rf.lastActiveTime = time.Now() // 为其他人投票，那么重置自己的下次投票时间
+			rf.lastActiveTime = time.Now() // 重置下次投票时间
 		}
-
 	}
 	rf.persist()
 }
@@ -369,118 +361,120 @@ func (rf *Raft) ticker() {
 
 		time.Sleep(1 * time.Millisecond)
 		func(){
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
 
-		now := time.Now()
-		// 随机设置超时时间
-		timeout := time.Duration(250+rand.Int31n(150)) * time.Millisecond
-		elapses := now.Sub(rf.lastActiveTime)
+			now := time.Now()
+			// 随机设置超时时间
+			timeout := time.Duration(200+rand.Int31n(150)) * time.Millisecond
+			elapses := now.Sub(rf.lastActiveTime)
+			if elapses < timeout{
+				return
+			}
+			// 超时 role 转变
+			if rf.role == ROLE_FOLLOWER {
+				rf.role = ROLE_CANDIDATES
+				DPrintf("RaftNode[%d] CurrentTerm %d To Candidate", rf.me, rf.currentTerm)
+			}
+			// 发送 vote 请求
+			if rf.role == ROLE_CANDIDATES {
 
-		// 超时 role 转变
-		if rf.role == ROLE_FOLLOWER  && elapses > timeout{
-			rf.role = ROLE_CANDIDATES
-			DPrintf("RaftNode[%d] CurrentTerm %d To Candidate", rf.me, rf.currentTerm)
-		}
-		// 发送 vote 请求
-		if rf.role == ROLE_CANDIDATES && elapses >= timeout {
+				// routine 操作
+				rf.lastActiveTime = now
+				rf.currentTerm += 1
+				rf.votedFor = rf.me
+				rf.persist()
 
-			// routine 操作
-			rf.lastActiveTime = now
-			rf.currentTerm += 1
-			rf.votedFor = rf.me
-			rf.persist()
-
-			// 请求投票req
-			request := RequestVoteArgs{
+				// 请求投票req
+				request := RequestVoteArgs{
 				Term:         rf.currentTerm,
 				CandidateId:  rf.me,
 				LastLogIndex: len(rf.log),
-			}
-			if len(rf.log) != 0 {
-				request.LastLogTerm = rf.log[len(rf.log)-1].Term
-			}
+				}
+				if len(rf.log) != 0 {
+					request.LastLogTerm = rf.log[len(rf.log)-1].Term
+				}
 
-			rf.mu.Unlock()
+				rf.mu.Unlock()
 
-			voteCount := 1   // 收到投票个数（先给自己投1票）
-			finishCount := 1 // 收到应答个数
-			voteResultChan := make(chan *RequestVoteReply, len(rf.peers))
+				voteCount := 1   // 收到投票个数（先给自己投1票）
+				finishCount := 1 // 收到应答个数
+				voteResultChan := make(chan *RequestVoteReply, len(rf.peers))
 				
-			// 发送VoteRequest
-			for peerId := 0; peerId < len(rf.peers); peerId++ {
-				go func(id int) {
-					DPrintf("RaftNode[%d] CurrentTerm %d Send VoteRequest", rf.me, rf.currentTerm)
-					if id == rf.me {
-						return
-					}
-					resp := RequestVoteReply{}
-					if ok := rf.sendRequestVote(id, &request, &resp); ok {
-						voteResultChan <- &resp
-					} else {
-						voteResultChan <- nil
-					}
-				}(peerId)
-			}
-
-			maxTerm := 0
-			for {
-				select {
-				case reply := <-voteResultChan:
-					finishCount += 1
-					DPrintf("RaftNode[%d] CurrentTerm %d Select FinishCount %d", rf.me, rf.currentTerm, finishCount)
-					if reply != nil {
-						if reply.VoteGranted {
-							voteCount += 1
+				// 发送VoteRequest
+				for peerId := 0; peerId < len(rf.peers); peerId++ {
+					go func(id int) {
+						DPrintf("RaftNode[%d] CurrentTerm %d Send VoteRequest", rf.me, rf.currentTerm)
+						if id == rf.me {
+							return
 						}
-						if reply.Term > maxTerm {
-							maxTerm = reply.Term
+						resp := RequestVoteReply{}
+						if ok := rf.sendRequestVote(id, &request, &resp); ok {
+							voteResultChan <- &resp
+						} else {
+							voteResultChan <- nil
+						}
+					}(peerId)
+				}
+
+				maxTerm := 0
+				for {
+					select {
+					case reply := <-voteResultChan:
+						finishCount += 1
+						DPrintf("RaftNode[%d] CurrentTerm %d Select FinishCount %d", rf.me, rf.currentTerm, finishCount)
+						if reply != nil {
+							if reply.VoteGranted {
+								voteCount += 1
+							}
+							if reply.Term > maxTerm {
+								maxTerm = reply.Term
+							}
+						}
+						if finishCount == len(rf.peers) || voteCount > len(rf.peers)/2 {
+							DPrintf("RaftNode[%d] CurrentTerm %d Goto VoteEnd", rf.me, rf.currentTerm)
+							goto VOTE_END
 						}
 					}
-					if finishCount == len(rf.peers) || voteCount > len(rf.peers)/2 {
-						DPrintf("RaftNode[%d] CurrentTerm %d Goto VoteEnd", rf.me, rf.currentTerm)
-						goto VOTE_END
-					}
 				}
-			}
-		VOTE_END:
-			rf.mu.Lock()
-			// 如果角色改变了，则忽略本轮投票结果
-			if rf.role != ROLE_CANDIDATES {
-				DPrintf("RaftNode[%d] CurrentTerm %d in VoteEnd but role not candidate", rf.me, rf.currentTerm)
-				return
-			}
-			// 发现了更高的任期，切回follower
-			if maxTerm > rf.currentTerm {
-				rf.role = ROLE_FOLLOWER
-				rf.leaderId = -1
-				rf.currentTerm = maxTerm
-				rf.votedFor = -1
-				rf.persist()
-				DPrintf("RaftNode[%d] CurrentTerm %d in VoteEnd but maxTerm greater currentTerm", rf.me, rf.currentTerm)
-				return
-			}
-			// 成为leader
-			if voteCount > len(rf.peers)/2 {
-				rf.role = ROLE_LEADER
-				rf.leaderId = rf.me
+			VOTE_END:
+				rf.mu.Lock()
+				// 如果角色改变了，则忽略本轮投票结果
+				if rf.role != ROLE_CANDIDATES {
+					DPrintf("RaftNode[%d] CurrentTerm %d in VoteEnd but role not candidate", rf.me, rf.currentTerm)
+					return
+				}
+				// 发现了更高的任期，切回follower
+				if maxTerm > rf.currentTerm {
+					rf.role = ROLE_FOLLOWER
+					rf.leaderId = -1
+					rf.currentTerm = maxTerm
+					rf.votedFor = -1
+					rf.persist()
+					DPrintf("RaftNode[%d] CurrentTerm %d in VoteEnd but maxTerm greater currentTerm", rf.me, rf.currentTerm)
+					return
+				}
+				// 成为leader
+				if voteCount > len(rf.peers)/2 {
+					rf.role = ROLE_LEADER
+					rf.leaderId = rf.me
 
-				// 设置 nextIndex[] 以及 matchIndex[]
-				rf.nextIndex = make([]int, len(rf.peers))
-				for i := 0; i < len(rf.peers); i++ {
-					rf.nextIndex[i] = len(rf.log) + 1
+					// 设置 nextIndex[] 以及 matchIndex[]
+					rf.nextIndex = make([]int, len(rf.peers))
+					for i := 0; i < len(rf.peers); i++ {
+						rf.nextIndex[i] = len(rf.log) + 1
+					}
+					rf.matchIndex = make([]int, len(rf.peers))
+					for i := 0; i < len(rf.peers); i++ {
+						rf.matchIndex[i] = 0
+					}
+					// 立即发送广播包
+					rf.lastBroadcastTime = time.Unix(0, 0)
+					return
 				}
-				rf.matchIndex = make([]int, len(rf.peers))
-				for i := 0; i < len(rf.peers); i++ {
-					rf.matchIndex[i] = 0
-				}
-				// 立即发送广播包
-				rf.lastBroadcastTime = time.Unix(0, 0)
-				return
 			}
-		}
-	}()
-}
+		}()
+	}
 }
 
 
@@ -501,12 +495,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.role = ROLE_FOLLOWER
-		rf.leaderId = args.LeaderId
 		rf.votedFor = -1
 		rf.leaderId = -1
+		rf.persist()
 	}
-
-	// 跟随新的LeaderId
+	rf.leaderId = args.LeaderId
 	rf.lastActiveTime = time.Now()
 
 	// Check Log is Vaild
@@ -566,7 +559,7 @@ func (rf *Raft) runAppendEntriesLoop() {
  
 			//发送心跳包
 			now := time.Now()
-			if now.Sub(rf.lastBroadcastTime) < 100*time.Millisecond {
+			if now.Sub(rf.lastBroadcastTime) < 50*time.Millisecond {
 				return
 			}
 			rf.lastBroadcastTime = time.Now()
@@ -643,7 +636,8 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 		func() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
- 
+			
+			// apply Log
 			for rf.commitIndex > rf.lastApplied {
 				rf.lastApplied += 1
 				appliedMsgs = append(appliedMsgs, ApplyMsg{
