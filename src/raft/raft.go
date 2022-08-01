@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -78,16 +79,16 @@ type Raft struct {
 	currentTerm       int 
 	votedFor          int
 	log               []LogEntry
-	// lastIncludedIndex int
-	// lastIncludedTerm  int
+	lastIncludedIndex int
+	lastIncludedTerm  int
 
 	// 所有服务器，易失状态
-	// commitIndex int
-	// lastApplied int
+	commitIndex int
+	lastApplied int
 
 	//Leader，易失状态
-	// nextIndex  []int //	每个follower的log同步起点索引（初始为leader log的最后一项）
-	// matchIndex []int // 每个follower的log同步进度（初始为0），和nextIndex强关联
+	nextIndex  []int //	每个follower的log同步起点索引（初始为leader log的最后一项）
+	matchIndex []int // 每个follower的实际log同步进度（初始为0），和nextIndex强关联
 
 	// 所有服务器，选举相关状态
 	role           string
@@ -250,6 +251,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		// 重置时间
 		rf.lastActiveTime = time.Now()
+
+				// 这里坑了好久，一定要严格遵守论文的逻辑，另外log长度一样也是可以给对方投票的
+		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= len(rf.log)) {
+			rf.votedFor = args.CandidateId
+			reply.VoteGranted = true
+			rf.lastActiveTime = time.Now() // 为其他人投票，那么重置自己的下次投票时间
+		}
+
 	}
 	rf.persist()
 }
@@ -309,7 +318,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+		// Check role
+	if rf.role != ROLE_LEADER {
+		return -1, -1, false
+	}
+ 
+	logEntry := LogEntry{
+		Command: command,
+		Term:    rf.currentTerm,
+	}
+	rf.log = append(rf.log, logEntry)
+	index = len(rf.log)
+	term = rf.currentTerm
+	rf.persist()
 
 	return index, term, isLeader
 }
@@ -350,7 +374,7 @@ func (rf *Raft) ticker() {
 
 		now := time.Now()
 		// 随机设置超时时间
-		timeout := time.Duration(5+rand.Int31n(15)) * time.Millisecond
+		timeout := time.Duration(250+rand.Int31n(150)) * time.Millisecond
 		elapses := now.Sub(rf.lastActiveTime)
 
 		// 超时 role 转变
@@ -358,7 +382,7 @@ func (rf *Raft) ticker() {
 			rf.role = ROLE_CANDIDATES
 			DPrintf("RaftNode[%d] CurrentTerm %d To Candidate", rf.me, rf.currentTerm)
 		}
-		// 请求vote
+		// 发送 vote 请求
 		if rf.role == ROLE_CANDIDATES && elapses >= timeout {
 
 			// routine 操作
@@ -383,7 +407,7 @@ func (rf *Raft) ticker() {
 			finishCount := 1 // 收到应答个数
 			voteResultChan := make(chan *RequestVoteReply, len(rf.peers))
 				
-			// 并发发送VoteRequest
+			// 发送VoteRequest
 			for peerId := 0; peerId < len(rf.peers); peerId++ {
 				go func(id int) {
 					DPrintf("RaftNode[%d] CurrentTerm %d Send VoteRequest", rf.me, rf.currentTerm)
@@ -436,12 +460,22 @@ func (rf *Raft) ticker() {
 				DPrintf("RaftNode[%d] CurrentTerm %d in VoteEnd but maxTerm greater currentTerm", rf.me, rf.currentTerm)
 				return
 			}
-			// 赢得大多数选票，则成为leader
+			// 成为leader
 			if voteCount > len(rf.peers)/2 {
 				rf.role = ROLE_LEADER
 				rf.leaderId = rf.me
-				rf.lastBroadcastTime = time.Unix(0, 0) // 令appendEntries广播立即执行
-				DPrintf("RaftNode[%d] CurrentTerm %d Goto Leader", rf.me, rf.currentTerm)
+
+				// 设置 nextIndex[] 以及 matchIndex[]
+				rf.nextIndex = make([]int, len(rf.peers))
+				for i := 0; i < len(rf.peers); i++ {
+					rf.nextIndex[i] = len(rf.log) + 1
+				}
+				rf.matchIndex = make([]int, len(rf.peers))
+				for i := 0; i < len(rf.peers); i++ {
+					rf.matchIndex[i] = 0
+				}
+				// 立即发送广播包
+				rf.lastBroadcastTime = time.Unix(0, 0)
 				return
 			}
 		}
@@ -450,6 +484,7 @@ func (rf *Raft) ticker() {
 }
 
 
+// 接收到Leader发送的AppendEntey请求时
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -457,25 +492,58 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
+
+	/* * * * * * * * * * *  Check Term * * * * * * * * * * */
 	if args.Term < rf.currentTerm {
 		return
 	}
 
-	// 发现更大的任期，则转为该任期的follower
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.role = ROLE_FOLLOWER
+		rf.leaderId = args.LeaderId
 		rf.votedFor = -1
 		rf.leaderId = -1
-		// 继续向下走
 	}
 
-	// 认识新的leader
-	rf.leaderId = args.LeaderId
-	// 刷新活跃时间
+	// 跟随新的LeaderId
 	rf.lastActiveTime = time.Now()
 
+	// Check Log is Vaild
+
+	// 本地日志落后，直接返回
+	if len(rf.log) < args.PrevLogIndex {
+		return
+	}
+	// same Index Log must has same Term
+	if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex - 1].Term != args.PrevLogTerm {
+		return
+	}
+
+	// 在本地添加leader传入的log entry
+	for i, logEntry := range args.Entries {
+		index := args.PrevLogIndex + i + 1
+		if index > len(rf.log) {
+			rf.log = append(rf.log, logEntry)
+		} else {
+			// same index but term not equal, must erase all log entry if it is after the index
+			if rf.log[index - 1].Term != logEntry.Term {
+				// leader logEntry 覆盖 foller 的logEntry
+				rf.log = rf.log[:index - 1]	
+				rf.log = append(rf.log, logEntry)
+			}
+		}
+	}
+
 	rf.persist()
+	// commit index = min(len(rf.log), args.LeaderCommit)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = args.LeaderCommit
+		if len(rf.log) < rf.commitIndex {
+			rf.commitIndex = len(rf.log)
+		}
+	}
+	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -490,7 +558,8 @@ func (rf *Raft) runAppendEntriesLoop() {
 		func() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
- 
+			
+			// role is not leader, return
 			if rf.role != ROLE_LEADER {
 				return
 			}
@@ -510,6 +579,14 @@ func (rf *Raft) runAppendEntriesLoop() {
 				args := AppendEntriesArgs{}
 				args.Term = rf.currentTerm
 				args.LeaderId = rf.me
+				args.LeaderCommit = rf.commitIndex
+				args.Entries = make([]LogEntry, 0)
+				args.PrevLogIndex = rf.nextIndex[peerId] - 1
+
+				if args.PrevLogIndex > 0 {
+					args.PrevLogTerm = rf.log[args.PrevLogIndex - 1].Term
+				}
+				args.Entries = append(args.Entries, rf.log[rf.nextIndex[peerId]-1:]...)
 
 				go func(id int, args1 *AppendEntriesArgs) {
 					DPrintf("RaftNode[%d] appendEntries starts, myTerm[%d] peerId[%d]", rf.me, args1.Term, id)
@@ -524,11 +601,67 @@ func (rf *Raft) runAppendEntriesLoop() {
 							rf.votedFor = -1
 							rf.persist()
 						}
+						// 成功复制logEntry
+						if reply.Success{
+							rf.nextIndex[id] += len(args1.Entries)
+							rf.matchIndex[id] = rf.nextIndex[id] - 1
+ 
+							sortedMatchIndex := make([]int, 0)
+							sortedMatchIndex = append(sortedMatchIndex, len(rf.log))
+							for i := 0; i < len(rf.peers); i++ {
+								if i == rf.me {
+									continue
+								}
+								sortedMatchIndex = append(sortedMatchIndex, rf.matchIndex[i])
+							}
+							sort.Ints(sortedMatchIndex)
+							newCommitIndex := sortedMatchIndex[len(rf.peers) / 2]
+							if newCommitIndex > rf.commitIndex && rf.log[newCommitIndex - 1].Term == rf.currentTerm {
+								rf.commitIndex = newCommitIndex
+							}
+						}else{
+							rf.nextIndex[id] -= 1
+							// 需要保证nextIndex > 1
+							if rf.nextIndex[id] < 1 {
+								rf.nextIndex[id] = 1
+							}
+						}
 						DPrintf("RaftNode[%d] appendEntries ends, peerTerm[%d] myCurrentTerm[%d] myRole[%s]", rf.me, reply.Term, rf.currentTerm, rf.role)
 					}
 				}(peerId, &args)
 			}
 		}()
+	}
+}
+
+func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
+	for !rf.killed(){
+		time.Sleep(10 * time.Millisecond)
+ 
+		var appliedMsgs = make([]ApplyMsg, 0)
+ 
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+ 
+			for rf.commitIndex > rf.lastApplied {
+				rf.lastApplied += 1
+				appliedMsgs = append(appliedMsgs, ApplyMsg{
+					CommandValid:  true,
+					Command:       rf.log[rf.lastApplied-1].Command,
+					CommandIndex:  rf.lastApplied,
+					SnapshotValid: false,
+					Snapshot:      []byte{},
+					SnapshotTerm:  0,
+					SnapshotIndex: 0,
+				})
+				DPrintf("RaftNode[%d] applyLog, currentTerm[%d] lastApplied[%d] commitIndex[%d]", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
+			}
+		}()
+		// 锁外提交给应用层
+		for _, msg := range appliedMsgs {
+			applyCh <- msg
+		}
 	}
 }
 
@@ -565,6 +698,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 	// leader 动作 
 	go rf.runAppendEntriesLoop()
+	go rf.applyLogLoop(applyCh)
 	DPrintf("Raftnode[%d]启动", me)
 
 	return rf
